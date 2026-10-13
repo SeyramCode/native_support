@@ -1,0 +1,39 @@
+{
+ "actions": [],
+ "creation": "2026-10-12 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "description": "When unchecked, Issues and Service Level Agreements behave exactly as standard ERPNext. Tier and SLA Item data are kept.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-10-12 15:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Native Support",
+ "name": "Native Support Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -5,6 +5,31 @@ app_description = "Item/serial driven SLA extension for the ERPNext Support modu
 app_email = "rgedzia@gmail.com"
 app_license = "mit"
 
+required_apps = ["erpnext"]
+
+after_install = "native_support.install.after_install"
+after_migrate = "native_support.install.after_migrate"
+before_uninstall = "native_support.install.before_uninstall"
+
+doctype_js = {"Issue": "public/js/issue.js"}
+
+override_doctype_class = {
+	"Service Level Agreement": "native_support.overrides.service_level_agreement.NativeSupportServiceLevelAgreement",
+}
+
+# Issue hooks run before ERPNext's wildcard SLA hook; see native_support/sla.py
+# Frappe checks incoming mail every 10 minutes; check every 3 while Native Support is enabled
+scheduler_events = {
+	"cron": {
+		"*/3 * * * *": ["native_support.utils.pull_emails"],
+	},
+}
+
+doc_events = {
+	"Issue": {"validate": "native_support.sla.validate_issue"},
+	"Communication": {"after_insert": "native_support.sla.on_communication_insert"},
+}
+
 # Apps
 # ------------------
 
