@@ -10,6 +10,7 @@ import re
 from html import unescape
 
 import frappe
+from frappe import _
 from erpnext.support.doctype.service_level_agreement import service_level_agreement as erpnext_sla
 from frappe.utils import getdate
 from rapidfuzz import fuzz, process
@@ -23,6 +24,10 @@ EXPIRED = "Expired"
 COVERED = "Covered"
 
 ENTITY_RANK = {"Customer": 0, "Customer Group": 1, "Territory": 2}
+
+MAX_ITEMS = 50
+# several values typed in one cell
+VALUE_SEPARATORS = re.compile(r"[,;\n]+")
 
 # close-match suggestions for a typed serial / part number (same cutoff ERPNext uses for party matching)
 SUGGESTION_CUTOFF = 80
@@ -47,10 +52,13 @@ def validate_issue(doc, method=None):
 	if not is_gated(doc):
 		return
 
+	# input errors are the agent's to fix; everything after this never blocks a ticket
+	clean_items(doc)
+
 	try:
 		doc.flags.native_support_sla = frappe._dict(sla=resolve_sla(doc))
 	except Exception:
-		# never block a ticket; ERPNext's standard SLA selection applies instead
+		# ERPNext's standard SLA selection applies instead
 		frappe.log_error(
 			title="Native Support: SLA resolution failed", reference_doctype="Issue", reference_name=doc.name
 		)
@@ -65,33 +73,65 @@ def is_gated(doc) -> bool:
 	return is_enabled() and bool(doc.is_new() or doc.get("ns_cover_status"))
 
 
+def clean_items(doc):
+	"""One value per Affected Items row: split cells holding several values, drop surrounding spaces."""
+	rows = []
+	for row in doc.get("ns_items"):
+		serials = split_values(row.serial_no)
+		parts = split_values(row.part_number)
+		if not (serials or parts):
+			frappe.throw(_("Affected Items row {0}: enter a Serial No or a Part Number.").format(row.idx))
+
+		row.serial_no = serials[0] if serials else None
+		row.part_number = parts[0] if parts else None
+		rows.append(row)
+		rows += [frappe._dict(serial_no=value) for value in serials[1:]]
+		rows += [frappe._dict(part_number=value) for value in parts[1:]]
+
+	if len(rows) > MAX_ITEMS:
+		frappe.throw(_("A ticket can hold at most {0} Affected Items.").format(MAX_ITEMS))
+
+	if len(rows) != len(doc.get("ns_items")):
+		doc.set("ns_items", [])
+		for row in rows:
+			doc.append("ns_items", {"serial_no": row.serial_no, "part_number": row.part_number})
+
+
+def split_values(text):
+	return [value.strip() for value in VALUE_SEPARATORS.split(text or "") if value.strip()]
+
+
 def resolve_sla(doc):
-	"""Record part number, tier and cover status on the ticket and return the SLA ERPNext may apply."""
-	doc.ns_serial_no = (doc.ns_serial_no or "").strip() or None
-	doc.ns_part_number = (doc.ns_part_number or "").strip() or None
+	"""Give every Affected Item its own cover; the most urgent covered item sets the ticket's SLA.
+
+	Returns the SLA ERPNext may apply, or None (no SLA until an item is known to be covered)."""
+	add_items_from_ticket(doc)
 
 	if current := get_current_coverage(doc):
+		# already covered: keep the SLA (and its timers); items added since only get their own cover
+		for row in doc.ns_items:
+			if not row.governing:
+				resolve_item(doc, row)
 		set_priority(doc, current, sla_changed=False)
 		return as_sla_result(current)
 
-	if not doc.ns_serial_no:
-		doc.ns_serial_no = find_serial(doc.subject, doc.description)
+	covered = []
+	for row in doc.ns_items:
+		coverage = resolve_item(doc, row)
+		if coverage and coverage.status == COVERED:
+			covered.append((row, coverage))
 
-	coverage = get_serial_coverage(doc.ns_serial_no, doc.customer) if doc.ns_serial_no else None
-	if coverage:
-		doc.ns_part_number = coverage.part_number
-	elif doc.ns_part_number and doc.customer:
-		# keep the agent's search text as typed: it may match several SLAs to choose from
-		coverage = get_part_coverage(doc.ns_part_number, doc.customer, doc.service_level_agreement)
-
-	if coverage:
-		doc.ns_cover_status = coverage.status
-	else:
-		doc.ns_cover_status = NOT_COVERED if (doc.ns_serial_no or doc.ns_part_number) else SERIAL_PENDING
-	doc.ns_sla_tier = coverage.ns_sla_tier if coverage else None
-
-	if not coverage or coverage.status != COVERED:
+	if not covered:
+		statuses = {row.cover_status for row in doc.ns_items}
+		doc.ns_cover_status = EXPIRED if EXPIRED in statuses else NOT_COVERED if statuses else SERIAL_PENDING
+		doc.ns_serial_no = doc.ns_part_number = doc.ns_sla_tier = None
 		return None
+
+	row, coverage = get_governing_item(doc, covered)
+	row.governing = 1
+	doc.ns_serial_no, doc.ns_part_number = row.serial_no, row.part_number
+	doc.ns_sla_tier = coverage.ns_sla_tier
+	doc.ns_cover_status = COVERED
 
 	if not doc.customer and coverage.entity_type == "Customer":
 		doc.customer = coverage.entity
@@ -100,20 +140,97 @@ def resolve_sla(doc):
 	return as_sla_result(coverage)
 
 
+def add_items_from_ticket(doc):
+	"""On a new ticket, or one with no items yet, add a row for each registered serial in its text.
+
+	Tickets from before Affected Items existed get a row from their single serial / part number."""
+	if doc.get("ns_items") and not doc.is_new():
+		return
+
+	if not doc.get("ns_items") and (doc.ns_serial_no or doc.ns_part_number):
+		doc.append("ns_items", {"serial_no": doc.ns_serial_no, "part_number": doc.ns_part_number})
+
+	add_serials(doc, find_serials(doc.subject, doc.description))
+
+
+def add_serials(doc, serials):
+	"""Append rows for serials not on the ticket yet; returns how many were added."""
+	known = {row.serial_no.upper() for row in doc.get("ns_items") if row.serial_no}
+	added = 0
+	for serial in serials:
+		if serial.upper() not in known and len(doc.get("ns_items")) < MAX_ITEMS:
+			doc.append("ns_items", {"serial_no": serial})
+			known.add(serial.upper())
+			added += 1
+	return added
+
+
+def resolve_item(doc, row):
+	"""Find and record the SLA covering one Affected Item; returns that SLA (with ``status``) or None."""
+	coverage = None
+	if row.serial_no:
+		coverage = get_serial_coverage(row.serial_no, doc.customer)
+		if coverage:
+			row.part_number, row.description = coverage.part_number, coverage.description
+	elif row.part_number and doc.customer:
+		coverage = get_part_coverage(row.part_number, doc.customer, doc.service_level_agreement)
+		if coverage and coverage.get("parts"):
+			row.description = coverage.parts[0].description
+
+	row.service_level_agreement = coverage.name if coverage else None
+	row.sla_tier = coverage.ns_sla_tier if coverage else None
+	row.cover_status = coverage.status if coverage else NOT_COVERED
+	row.governing = 0
+	return coverage
+
+
+def get_governing_item(doc, covered):
+	"""The SLA the agent applied, if it covers an item; else the fastest response, then the first row."""
+	if applied := get_applied_sla(doc):
+		for row, coverage in covered:
+			if coverage.name == applied:
+				return row, coverage
+
+	return min(covered, key=lambda pair: get_response_seconds(pair[1]))
+
+
+def get_applied_sla(doc):
+	"""SLA the agent set in this save (the Active SLAs card's Apply button), not the one kept from before."""
+	before = doc.get_doc_before_save()
+	if doc.service_level_agreement and (
+		not before or before.service_level_agreement != doc.service_level_agreement
+	):
+		return doc.service_level_agreement
+
+
+def get_response_seconds(agreement):
+	response = frappe.db.get_value(
+		"Service Level Priority",
+		{"parent": agreement.name, "parenttype": "Service Level Agreement", "priority": agreement.default_priority},
+		"response_time",
+	)
+	return response if response is not None else float("inf")
+
+
 def get_current_coverage(doc):
 	"""A covered ticket stays on the SLA it was logged under, even if that SLA later expires or its items
-	change, so its response / resolution history is kept. Only a change by the agent to the customer,
-	serial, part number or SLA makes it look again."""
+	change, so its response / resolution history is kept. Only an agent's change to the customer, the SLA
+	or the Affected Items makes it look again; rows added from an emailed reply do not."""
 	before = doc.get_doc_before_save()
 	if not before or before.get("ns_cover_status") != COVERED or not doc.service_level_agreement:
 		return None
 
-	if any(
-		doc.get(f) != before.get(f) for f in ("customer", "ns_serial_no", "ns_part_number", "service_level_agreement")
-	):
+	if doc.customer != before.customer or doc.service_level_agreement != before.service_level_agreement:
+		return None
+
+	if not doc.flags.native_support_items_from_reply and get_item_keys(doc) != get_item_keys(before):
 		return None
 
 	return frappe.db.get_value("Service Level Agreement", doc.service_level_agreement, SLA_FIELDS, as_dict=True)
+
+
+def get_item_keys(doc):
+	return sorted(((row.serial_no or "").upper(), (row.part_number or "").upper()) for row in doc.get("ns_items"))
 
 
 def set_priority(doc, agreement, sla_changed):
@@ -127,13 +244,13 @@ def set_priority(doc, agreement, sla_changed):
 		doc.priority = agreement.default_priority or priorities[0]
 
 
-def find_serial(*texts):
-	"""Return the registered SLA Item serial that appears first in the given texts (whole word, any case)."""
+def find_serials(*texts):
+	"""Registered SLA Item serials found in the texts (whole word, any case), in order of appearance."""
 	text = " ".join(html_to_text(t) for t in texts if t)
 	if not text.strip():
-		return None
+		return []
 
-	found = None
+	found = {}
 	for serial in frappe.get_all(
 		"SLA Item",
 		filters={"parenttype": "Service Level Agreement", "parentfield": "ns_sla_items", "serial_no": ["is", "set"]},
@@ -142,10 +259,10 @@ def find_serial(*texts):
 	):
 		# not part of a longer serial: "ABC-1" must not match inside "ABC-12" or "XABC-1"
 		match = re.search(rf"(?<![\w-]){re.escape(serial.strip())}(?![\w-])", text, re.IGNORECASE)
-		if match and (not found or match.start() < found[0]):
-			found = (match.start(), serial)
+		if match and serial.upper() not in found:
+			found[serial.upper()] = (match.start(), serial)
 
-	return found[1] if found else None
+	return [serial for _position, serial in sorted(found.values())]
 
 
 def html_to_text(html):
@@ -158,15 +275,15 @@ def get_serial_coverage(serial_no, customer=None):
 	items = frappe.get_all(
 		"SLA Item",
 		filters={"parenttype": "Service Level Agreement", "parentfield": "ns_sla_items", "serial_no": serial_no},
-		fields=["parent", "part_number"],
+		fields=["parent", "part_number", "description"],
 	)
 	if not items:
 		return None
 
-	part_number = {d.parent: d.part_number for d in items}
+	item = {d.parent: d for d in items}
 	agreements = frappe.get_all(
 		"Service Level Agreement",
-		filters={"name": ["in", list(part_number)], "document_type": "Issue"},
+		filters={"name": ["in", list(item)], "document_type": "Issue"},
 		fields=SLA_FIELDS,
 	)
 	if customer:
@@ -178,7 +295,8 @@ def get_serial_coverage(serial_no, customer=None):
 
 	today = getdate()
 	for agreement in agreements:
-		agreement.part_number = part_number[agreement.name]
+		agreement.part_number = item[agreement.name].part_number
+		agreement.description = item[agreement.name].description
 		if agreement.end_date and getdate(agreement.end_date) < today:
 			agreement.status = EXPIRED
 		elif agreement.enabled and (not agreement.start_date or getdate(agreement.start_date) <= today):
@@ -281,23 +399,35 @@ def get_active_customer_slas(customer, part_number=None, serial_no=None):
 
 
 @frappe.whitelist()
-def get_customer_slas(customer, part_number=None, serial_no=None):
+def get_customer_slas(customer, items=None):
 	"""Data for the Issue form's Active SLAs card; None when Native Support is disabled.
 
-	With a serial or part number only the SLAs covering it are returned. When nothing covers it,
-	close values from the customer's active SLAs are offered for the agent to pick; they are never applied
-	automatically."""
+	``slas``: the customer's active SLAs. ``items``: for each Affected Item (``[{serial_no, part_number}]``),
+	the active SLAs covering it, or close values from those SLAs for the agent to pick when none does.
+	Suggestions are never applied automatically."""
 	frappe.has_permission("Issue", "read", throw=True)
 	if not is_enabled() or not customer:
 		return None
 
-	agreements = get_active_customer_slas(customer, part_number, serial_no)
-	if not (serial_no or part_number):
-		return {"slas": agreements, "suggestions": []}
+	agreements = get_active_customer_slas(customer)
+	results = []
+	for item in (frappe.parse_json(items) or [])[:MAX_ITEMS]:
+		serial_no = (item.get("serial_no") or "").strip() or None
+		part_number = (item.get("part_number") or "").strip() or None
+		if not (serial_no or part_number):
+			continue
 
-	matches = [a for a in agreements if a.parts]
-	suggestions = [] if matches else get_suggestions(agreements, serial_no, part_number)
-	return {"slas": matches, "suggestions": suggestions}
+		matches = [a for a in get_active_customer_slas(customer, part_number, serial_no) if a.parts]
+		results.append(
+			{
+				"serial_no": serial_no,
+				"part_number": part_number,
+				"slas": matches,
+				"suggestions": [] if matches else get_suggestions(agreements, serial_no, part_number),
+			}
+		)
+
+	return {"slas": agreements, "items": results}
 
 
 def get_suggestions(agreements, serial_no=None, part_number=None):
@@ -356,23 +486,20 @@ def as_sla_result(agreement):
 
 
 def on_communication_insert(doc, method=None):
-	"""Pick up a serial from a customer's emailed reply to a ticket that is still waiting for one."""
+	"""Add the registered serials in a customer's emailed reply to the ticket's Affected Items."""
 	if doc.reference_doctype != "Issue" or not doc.reference_name or doc.sent_or_received != "Received":
 		return
 
-	if not is_enabled():
-		return
-
-	issue = frappe.db.get_value("Issue", doc.reference_name, ["ns_cover_status", "ns_serial_no"], as_dict=True)
-	if not issue or issue.ns_cover_status != SERIAL_PENDING or issue.ns_serial_no:
+	if not is_enabled() or not frappe.db.get_value("Issue", doc.reference_name, "ns_cover_status"):
 		return
 
 	frappe.db.savepoint("native_support_serial")
 	try:
-		serial_no = find_serial(doc.subject, doc.content)
-		if serial_no:
-			ticket = frappe.get_doc("Issue", doc.reference_name)
-			ticket.ns_serial_no = serial_no
+		serials = find_serials(doc.subject, doc.content)
+		ticket = frappe.get_doc("Issue", doc.reference_name) if serials else None
+		if ticket and add_serials(ticket, serials):
+			# a covered ticket keeps its SLA; the new rows only get their own cover
+			ticket.flags.native_support_items_from_reply = True
 			# like email intake: agent-filled mandatory fields must not stop the serial being recorded
 			ticket.flags.ignore_mandatory = True
 			ticket.save(ignore_permissions=True)
