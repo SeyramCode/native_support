@@ -36,6 +36,17 @@ class TestItemSLA(FrappeTestCase):
 		self.assertEqual(issue.ns_sla_tier, "Premium")
 		self.assertEqual(issue.ns_serial_no, FAST)
 		self.assertEqual([row.serial_no for row in issue.ns_items if row.governing], [FAST])
+		self.assertEqual(issue.ns_serials_covered, "2 of 2")
+
+	def test_serials_covered_counts_only_serials(self):
+		issue = make_issue(
+			self.customer,
+			"Mixed",
+			items=[{"serial_no": FAST}, {"serial_no": "NS-UNKNOWN-1"}, {"part_number": "C9200"}],
+		)
+
+		self.assertEqual(issue.ns_serials_covered, "1 of 2")
+		self.assertEqual(issue.ns_cover_status, "Covered")
 
 	def test_several_values_in_one_cell_become_rows(self):
 		issue = make_issue(self.customer, "Devices down", items=[{"serial_no": f"{SLOW}, {FAST}"}])
@@ -47,6 +58,7 @@ class TestItemSLA(FrappeTestCase):
 
 		self.assertEqual(issue.service_level_agreement, self.slow)
 		self.assertEqual(issue.ns_items[0].service_level_agreement, self.slow)
+		self.assertFalse(issue.ns_serials_covered)
 
 	def test_no_covered_item_no_sla(self):
 		issue = make_issue(self.customer, "Unknown device", items=[{"serial_no": "NS-UNKNOWN-1"}])

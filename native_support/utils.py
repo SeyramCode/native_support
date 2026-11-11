@@ -13,6 +13,11 @@ def is_enabled() -> bool:
 		return False
 
 
+def boot_session(bootinfo):
+	"""Lets form fields show only while Native Support is enabled (``frappe.boot.native_support_enabled``)."""
+	bootinfo.native_support_enabled = is_enabled()
+
+
 def pull_emails():
 	"""Check incoming mail every 3 minutes instead of Frappe's 10 (scheduled in hooks.py).
 

@@ -35,8 +35,8 @@ CUSTOM_FIELDS = {
 			"fieldtype": "Section Break",
 			"label": "SLA Coverage",
 			"insert_after": "description",
-			# only tickets created while Native Support is enabled
-			"depends_on": "eval:doc.__islocal || doc.ns_cover_status",
+			# only while Native Support is enabled, on tickets created while it was
+			"depends_on": "eval:frappe.boot.native_support_enabled && (doc.__islocal || doc.ns_cover_status)",
 		},
 		{
 			"fieldname": "ns_items",
@@ -50,7 +50,7 @@ CUSTOM_FIELDS = {
 			"fieldname": "ns_sla_summary_section",
 			"fieldtype": "Section Break",
 			"insert_after": "ns_items",
-			"depends_on": "eval:doc.__islocal || doc.ns_cover_status",
+			"depends_on": "eval:frappe.boot.native_support_enabled && (doc.__islocal || doc.ns_cover_status)",
 		},
 		{
 			"fieldname": "ns_cover_status",
@@ -63,11 +63,20 @@ CUSTOM_FIELDS = {
 			"in_standard_filter": 1,
 		},
 		{
+			"fieldname": "ns_serials_covered",
+			"fieldtype": "Data",
+			"label": "Serials Covered",
+			"insert_after": "ns_cover_status",
+			"depends_on": "eval:doc.ns_serials_covered",
+			"read_only": 1,
+			"no_copy": 1,
+		},
+		{
 			"fieldname": "ns_sla_tier",
 			"fieldtype": "Link",
 			"label": "SLA Tier",
 			"options": "SLA Tier",
-			"insert_after": "ns_cover_status",
+			"insert_after": "ns_serials_covered",
 			"depends_on": "eval:doc.ns_sla_tier",
 			"read_only": 1,
 			"no_copy": 1,

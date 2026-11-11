@@ -13,8 +13,6 @@ import frappe
 from frappe import _
 from erpnext.support.doctype.service_level_agreement import service_level_agreement as erpnext_sla
 from frappe.utils import getdate
-from rapidfuzz import fuzz, process
-from rapidfuzz.utils import default_process
 
 from native_support.utils import is_enabled
 
@@ -29,9 +27,6 @@ MAX_ITEMS = 50
 # several values typed in one cell
 VALUE_SEPARATORS = re.compile(r"[,;\n]+")
 
-# close-match suggestions for a typed serial / part number (same cutoff ERPNext uses for party matching)
-SUGGESTION_CUTOFF = 80
-SUGGESTION_LIMIT = 5
 SLA_FIELDS = [
 	"name",
 	"enabled",
@@ -56,7 +51,9 @@ def validate_issue(doc, method=None):
 	clean_items(doc)
 
 	try:
-		doc.flags.native_support_sla = frappe._dict(sla=resolve_sla(doc))
+		sla = resolve_sla(doc)
+		set_serial_stats(doc)
+		doc.flags.native_support_sla = frappe._dict(sla=sla)
 	except Exception:
 		# ERPNext's standard SLA selection applies instead
 		frappe.log_error(
@@ -138,6 +135,13 @@ def resolve_sla(doc):
 
 	set_priority(doc, coverage, sla_changed=doc.service_level_agreement != coverage.name)
 	return as_sla_result(coverage)
+
+
+def set_serial_stats(doc):
+	"""Serials Covered on the ticket, e.g. "2 of 3"; empty when no serial was received."""
+	serials = [row for row in doc.get("ns_items") if row.serial_no]
+	covered = sum(row.cover_status == COVERED for row in serials)
+	doc.ns_serials_covered = _("{0} of {1}").format(covered, len(serials)) if serials else None
 
 
 def add_items_from_ticket(doc):
@@ -346,10 +350,10 @@ def like_pattern(text):
 	return f"%{text}%"
 
 
-def get_active_customer_slas(customer, part_number=None, serial_no=None):
+def get_active_customer_slas(customer, part_number=None):
 	"""Enabled, in-date Issue SLAs held by the customer (directly or via its group / territory).
 
-	With ``serial_no`` (exact) or else ``part_number`` (contains), each SLA carries its matching SLA Item rows."""
+	With ``part_number``, each SLA carries the SLA Item rows whose part number contains it."""
 	scope = get_customer_scope(customer)
 	today = getdate()
 	agreements = [
@@ -370,21 +374,14 @@ def get_active_customer_slas(customer, part_number=None, serial_no=None):
 	]
 
 	parts = {}
-	item_filter = (
-		{"serial_no": serial_no.strip()}
-		if serial_no
-		else {"part_number": ["like", like_pattern(part_number)]}
-		if part_number
-		else None
-	)
-	if item_filter and agreements:
+	if part_number and agreements:
 		for row in frappe.get_all(
 			"SLA Item",
 			filters={
 				"parenttype": "Service Level Agreement",
 				"parentfield": "ns_sla_items",
 				"parent": ["in", [a.name for a in agreements]],
-				**item_filter,
+				"part_number": ["like", like_pattern(part_number)],
 			},
 			fields=["parent", "part_number", "description", "qty", "serial_no"],
 			order_by="idx asc",
@@ -396,75 +393,6 @@ def get_active_customer_slas(customer, part_number=None, serial_no=None):
 
 	agreements.sort(key=lambda a: (ENTITY_RANK.get(a.entity_type, 3), getdate(a.end_date or "9999-12-31")))
 	return agreements
-
-
-@frappe.whitelist()
-def get_customer_slas(customer, items=None):
-	"""Data for the Issue form's Active SLAs card; None when Native Support is disabled.
-
-	``slas``: the customer's active SLAs. ``items``: for each Affected Item (``[{serial_no, part_number}]``),
-	the active SLAs covering it, or close values from those SLAs for the agent to pick when none does.
-	Suggestions are never applied automatically."""
-	frappe.has_permission("Issue", "read", throw=True)
-	if not is_enabled() or not customer:
-		return None
-
-	agreements = get_active_customer_slas(customer)
-	results = []
-	for item in (frappe.parse_json(items) or [])[:MAX_ITEMS]:
-		serial_no = (item.get("serial_no") or "").strip() or None
-		part_number = (item.get("part_number") or "").strip() or None
-		if not (serial_no or part_number):
-			continue
-
-		matches = [a for a in get_active_customer_slas(customer, part_number, serial_no) if a.parts]
-		results.append(
-			{
-				"serial_no": serial_no,
-				"part_number": part_number,
-				"slas": matches,
-				"suggestions": [] if matches else get_suggestions(agreements, serial_no, part_number),
-			}
-		)
-
-	return {"slas": agreements, "items": results}
-
-
-def get_suggestions(agreements, serial_no=None, part_number=None):
-	"""Serials (or part numbers) on these SLAs that closely resemble what was typed, best first."""
-	field, typed = ("serial_no", serial_no) if serial_no else ("part_number", part_number)
-	tier = {a.name: a.ns_sla_tier for a in agreements}
-	rows = frappe.get_all(
-		"SLA Item",
-		filters={
-			"parenttype": "Service Level Agreement",
-			"parentfield": "ns_sla_items",
-			"parent": ["in", list(tier) or [""]],
-			field: ["is", "set"],
-		},
-		fields=["parent", "part_number", "description", "serial_no"],
-	)
-
-	results = process.extract(
-		typed,
-		{i: row[field] for i, row in enumerate(rows)},
-		scorer=fuzz.ratio,
-		processor=default_process,
-		score_cutoff=SUGGESTION_CUTOFF,
-		limit=SUGGESTION_LIMIT,
-	)
-	return [
-		{
-			"field": field,
-			"value": value,
-			"score": round(score),
-			"sla": rows[i].parent,
-			"tier": tier[rows[i].parent],
-			"part_number": rows[i].part_number,
-			"description": rows[i].description,
-		}
-		for value, score, i in results
-	]
 
 
 def get_customer_scope(customer):

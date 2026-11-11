@@ -11,7 +11,7 @@ after_install = "native_support.install.after_install"
 after_migrate = "native_support.install.after_migrate"
 before_uninstall = "native_support.install.before_uninstall"
 
-doctype_js = {"Issue": "public/js/issue.js"}
+extend_bootinfo = "native_support.utils.boot_session"
 
 override_doctype_class = {
 	"Service Level Agreement": "native_support.overrides.service_level_agreement.NativeSupportServiceLevelAgreement",
