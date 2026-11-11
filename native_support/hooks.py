@@ -13,6 +13,8 @@ before_uninstall = "native_support.install.before_uninstall"
 
 extend_bootinfo = "native_support.utils.boot_session"
 
+doctype_js = {"Issue": "public/js/issue.js"}
+
 override_doctype_class = {
 	"Service Level Agreement": "native_support.overrides.service_level_agreement.NativeSupportServiceLevelAgreement",
 }
